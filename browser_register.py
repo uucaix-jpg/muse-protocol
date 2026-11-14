@@ -58,6 +58,55 @@ def browser_api(page, method, path, body=None):
     )
 
 
+def resolve_locale(cfg):
+    loc = (cfg.get("browser_locale") or "").strip()
+    if loc:
+        return loc
+    lang = (cfg.get("lang") or "ja").strip()
+    low = lang.lower()
+    if low in ("ja", "ja-jp"):
+        return "ja-JP"
+    if low in ("en", "en-us"):
+        return "en-US"
+    if "-" in lang or "_" in lang:
+        return lang.replace("_", "-")
+    return "ja-JP"
+
+
+def resolve_timezone(cfg, browser_locale):
+    tz = (cfg.get("browser_timezone") or "").strip()
+    if tz:
+        return tz
+    low = (browser_locale or "").lower()
+    if low.startswith("ja"):
+        return "Asia/Tokyo"
+    if low.startswith("en-us"):
+        return "America/Los_Angeles"
+    return None
+
+
+def _chrome_ua(browser):
+    major = (getattr(browser, "version", "") or "131").split(".")[0] or "131"
+    return (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        f"Chrome/{major}.0.0.0 Safari/537.36"
+    )
+
+
+def _fetch_ip_info(proxy=None):
+    try:
+        from curl_cffi import requests as cr
+        proxies = {"http": proxy, "https": proxy} if proxy else None
+        r = cr.get("https://ipinfo.io/json", proxies=proxies, timeout=6)
+        if r.status_code == 200:
+            d = r.json() or {}
+            return f"ip={d.get('ip')} country={d.get('country')} city={d.get('city')} org={d.get('org')}"
+    except Exception:
+        pass
+    return None
+
+
 def main():
     import re
     import uuid
@@ -66,6 +115,8 @@ def main():
     email = resolve_email(cfg)
     proxy = (cfg.get("proxy") or "").strip() or None
     invite_code = (cfg.get("invite_code") or "").strip()
+    browser_locale = resolve_locale(cfg)
+    browser_tz = resolve_timezone(cfg, browser_locale)
 
     rand_first, rand_last = random_name()
     first = (cfg.get("first_name") or "").strip() or rand_first
@@ -80,7 +131,10 @@ def main():
 
     state = {
         "uid": None,
+        "send_otp_status": None,
+        "send_otp_body": None,
         "confirm_status": None,
+        "confirm_body": None,
         "reg_status": None,
         "reg_body": None,
         "confirm_data": {},
@@ -103,16 +157,15 @@ def main():
             launch_kwargs["proxy"] = {"server": proxy}
 
         browser = p.chromium.launch(**launch_kwargs)
-        context = browser.new_context(
-            locale=cfg.get("browser_locale", "zh-CN"),
-            viewport={"width": 1440, "height": 900},
-            device_scale_factor=2,
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
-        )
+        ctx_kwargs = {
+            "locale": browser_locale,
+            "viewport": {"width": 1440, "height": 900},
+            "device_scale_factor": 2,
+            "user_agent": _chrome_ua(browser),
+        }
+        if browser_tz:
+            ctx_kwargs["timezone_id"] = browser_tz
+        context = browser.new_context(**ctx_kwargs)
         context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
         )
@@ -138,7 +191,14 @@ def main():
         def _is_traced(url):
             return (
                 ("muse.ai" in url or "auth.meta.com" in url)
-                and ("/api/" in url or "/hatch/" in url or url.rstrip("/") in ("https://muse.ai", "https://muse.ai/?aymh_complete=1"))
+                and (
+                    "/api/" in url
+                    or "/hatch/" in url
+                    or "/aymh/" in url
+                    or "/oidc/" in url
+                    or "/access" in url
+                    or url.rstrip("/") in ("https://muse.ai", "https://muse.ai/?aymh_complete=1")
+                )
             )
 
         def on_request(req):
@@ -198,12 +258,21 @@ def main():
                         except Exception:
                             pass
                         break
-            if "/api/auth/native/confirm-otp" in url:
+            if "/api/auth/native/send-otp" in url:
+                state["send_otp_status"] = resp.status
+                try:
+                    state["send_otp_body"] = resp.text()[:200]
+                except Exception:
+                    pass
+            elif "/api/auth/native/confirm-otp" in url:
                 state["confirm_status"] = resp.status
                 try:
                     state["confirm_data"] = resp.json() or {}
                 except Exception:
-                    pass
+                    try:
+                        state["confirm_body"] = resp.text()[:200]
+                    except Exception:
+                        pass
             elif "/api/auth/native/register-completion" in url:
                 state["reg_status"] = resp.status
                 try:
@@ -217,7 +286,7 @@ def main():
 
         page.on("response", on_response)
 
-        print(f"[1] 真实浏览器打开首页  {email}")
+        print(f"[1] 真实浏览器打开首页  {email}  (locale={browser_locale}, tz={browser_tz or 'default'})")
         page.goto("https://muse.ai/", wait_until="domcontentloaded", timeout=60000)
 
         email_input = page.locator('input[autocomplete="username webauthn"], input[inputmode="email"]').first
@@ -234,8 +303,17 @@ def main():
         time.sleep(0.5)
         page.locator('form button[type="submit"]').first.click()
 
-        # OTP 页面的真实输入框带 sr-only，等待可见的 6 格验证码区域
-        page.locator('[data-slot="pin-digit"]').first.wait_for(state="visible", timeout=30000)
+        # OTP 页面的真实输入框带 sr-only，等待可见的 6 格验证码区域（若 send-otp 报错则立即失败）
+        pin_digit = page.locator('[data-slot="pin-digit"]').first
+        for _ in range(60):
+            if pin_digit.is_visible():
+                break
+            if state["send_otp_status"] and state["send_otp_status"] >= 400:
+                browser.close()
+                raise SystemExit(f"发送验证码失败: send-otp {state['send_otp_status']}: {state['send_otp_body']}")
+            page.wait_for_timeout(500)
+        else:
+            pin_digit.wait_for(state="visible", timeout=1000)
 
         if otp_client:
             print("    正在通过 Cloudflare Email Worker 自动等待验证码...")
@@ -251,8 +329,18 @@ def main():
         page.locator('[data-slot="pin-digit"]').first.click()
         page.keyboard.type(code, delay=80)
 
-        # 等待确认并跳转至生日（和可选姓名）页面
-        page.locator('button[role="combobox"]').first.wait_for(state="visible", timeout=30000)
+        # 等待确认并跳转至生日（和可选姓名）页面（若 confirm-otp 报错则立即失败）
+        first_combo = page.locator('button[role="combobox"]').first
+        for _ in range(60):
+            if first_combo.is_visible():
+                break
+            if state["confirm_status"] and state["confirm_status"] >= 400:
+                err = state["confirm_data"] or state["confirm_body"]
+                browser.close()
+                raise SystemExit(f"校验验证码失败: confirm-otp {state['confirm_status']}: {err}")
+            page.wait_for_timeout(500)
+        else:
+            first_combo.wait_for(state="visible", timeout=1000)
 
         given_input = page.locator('input[autocomplete="given-name"]')
         if given_input.count() > 0 and given_input.first.is_visible():
@@ -262,7 +350,7 @@ def main():
         else:
             print(f"[4] 填写生日  {dob}")
 
-        # 分别设置生日下拉框（年 / 月 / 日）
+        # 分别设置生日下拉框（年 / 月 / 日，兼容 ja-JP / en-US / zh-CN）
         try:
             combos = page.locator('button[role="combobox"]')
             for i in range(combos.count()):
@@ -274,8 +362,7 @@ def main():
                     break
             for i in range(combos.count()):
                 txt = combos.nth(i).inner_text().strip()
-                digits = "".join(ch for ch in txt if ch.isdigit())
-                if digits and len(digits) <= 2 and "月" not in txt and int(digits) <= 31:
+                if txt.isdigit() and 1 <= int(txt) <= 31:
                     combos.nth(i).click()
                     page.get_by_role("option", name=str(int(dob_day)), exact=True).click(timeout=5000)
                     break
@@ -283,7 +370,7 @@ def main():
                 txt = combos.nth(i).inner_text().strip()
                 digits = "".join(ch for ch in txt if ch.isdigit())
                 is_year = len(digits) == 4 and int(digits) >= 1900
-                is_day = bool(digits) and len(digits) <= 2 and "月" not in txt and int(digits) <= 31
+                is_day = txt.isdigit() and 1 <= int(txt) <= 31
                 if not is_year and not is_day:
                     combos.nth(i).click()
                     page.locator('[role="option"]').nth(int(dob_month) - 1).click(timeout=5000)
@@ -341,6 +428,13 @@ def main():
         else:
             print(f"    当前页面: {page.url}")
 
+        html_sync = page.content().replace('\\"', '"')
+        geo_m = re.search(r'"isGeoGated"\s*:\s*(true|false)', html_sync)
+        is_geogated = geo_m.group(1) == "true" if geo_m else None
+        if is_geogated:
+            ip_info = _fetch_ip_info(proxy)
+            print(f"    ⚠️ 服务端返回 isGeoGated=true (exit: {ip_info or 'unknown'})")
+
         # 在同一浏览器会话内执行激活、唤醒、兑换
         print("[6] 激活会话（accept-tos）")
         inv = browser_api(page, "GET", "/api/hatch/invite")
@@ -370,8 +464,8 @@ def main():
         if not live:
             try:
                 btns = [b.strip() for b in page.locator("button:visible").all_inner_texts() if b.strip()][:8]
-                if btns or state["hatch_logs"]:
-                    print(f"    页面调试: buttons={btns} auto_hatch={state['hatch_logs']}")
+                body_txt = re.sub(r"\s+", " ", page.locator("body").inner_text()).strip()[:160]
+                print(f"    页面调试: isGeoGated={is_geogated} buttons={btns} auto_hatch={state['hatch_logs']} text={body_txt}")
             except Exception:
                 pass
 
@@ -409,17 +503,24 @@ def main():
                 page,
                 "POST",
                 "/api/hatch/invite-code/redeem",
-                {"code": invite_code, "supportsRedemptionStatus": True},
+                {"code": invite_code, "supportsPendingRedemption": True},
             )
             data = red["json"] or {}
-            ok = red["status"] == 200 and (data.get("success") is True or data.get("redemptionStatus") == "redeemed")
-            reason = "redeemed" if ok else (data.get("reason") or f"http-{red['status']}: {red['text'][:160]}")
+            status_val = data.get("redemptionStatus")
+            ok = red["status"] == 200 and (data.get("success") is True or status_val == "redeemed")
+            if ok and status_val == "pending":
+                ok = False
+                reason = "pending"
+            else:
+                reason = "redeemed" if ok else (data.get("reason") or f"http-{red['status']}: {red['text'][:160]}")
             print(f"    redeem = {ok} / {reason}")
-            if ok:
+            if ok and reason == "redeemed":
                 sc = browser_api(page, "POST", "/api/hatch/invite", "")
                 if sc["status"] == 200 and sc["json"]:
                     own = sc["json"].get("code")
                 print(f"[9] 自己的邀请码 = {own}")
+            elif reason == "pending":
+                print("    邀请码已提交为待处理状态（pending），暂不可刮取新码")
             else:
                 print("    失败原因映射: already_redeemed=本账号已用过码  used_up=该码已达使用上限  invalid=码不存在")
 
@@ -466,6 +567,9 @@ def probe():
     cfg = load_config()
     proxy = (cfg.get("proxy") or "").strip() or None
     invite_code = (cfg.get("invite_code") or "").strip()
+    browser_locale = resolve_locale(cfg)
+    browser_tz = resolve_timezone(cfg, browser_locale)
+    print("exit_ip:", _fetch_ip_info(proxy) or "unknown")
 
     trace_domain = "muse.ai"
     if os.path.exists(".last_browser_trace.json"):
@@ -502,7 +606,7 @@ def probe():
     if not rec:
         raise SystemExit("accounts.jsonl 中没有带 hatch_sess 的记录")
 
-    print(f"\n=== 使用已保存会话探测: {rec.get('email')} (id={rec.get('account_id')}) ===")
+    print(f"\n=== 使用已保存会话探测: {rec.get('email')} (id={rec.get('account_id')}, locale={browser_locale}, tz={browser_tz or 'default'}) ===")
     with sync_playwright() as p:
         launch_kwargs = {
             "headless": True,
@@ -511,15 +615,15 @@ def probe():
         if proxy:
             launch_kwargs["proxy"] = {"server": proxy}
         browser = p.chromium.launch(**launch_kwargs)
-        context = browser.new_context(
-            locale="ja-JP",
-            viewport={"width": 1440, "height": 900},
-            device_scale_factor=2,
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-            ),
-        )
+        ctx_kwargs = {
+            "locale": browser_locale,
+            "viewport": {"width": 1440, "height": 900},
+            "device_scale_factor": 2,
+            "user_agent": _chrome_ua(browser),
+        }
+        if browser_tz:
+            ctx_kwargs["timezone_id"] = browser_tz
+        context = browser.new_context(**ctx_kwargs)
         context.add_cookies([{
             "name": "hatch_sess",
             "value": rec["hatch_sess"],

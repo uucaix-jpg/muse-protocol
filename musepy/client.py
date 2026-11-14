@@ -9,6 +9,7 @@ import random
 import re
 import time
 import uuid
+from urllib.parse import urljoin, urlparse
 
 from curl_cffi import requests as cr
 
@@ -22,6 +23,7 @@ HEADERS_JSON = {
     "content-type": "application/json",
     "origin": BASE,
     "referer": BASE + "/",
+    "priority": "u=1, i",
     "sec-fetch-site": "same-origin",
     "sec-fetch-mode": "cors",
     "sec-fetch-dest": "empty",
@@ -31,6 +33,7 @@ HEADERS_JSON = {
 HEADERS_GET = {
     "accept": "*/*",
     "referer": BASE + "/",
+    "priority": "u=1, i",
     "sec-fetch-site": "same-origin",
     "sec-fetch-mode": "cors",
     "sec-fetch-dest": "empty",
@@ -38,11 +41,22 @@ HEADERS_GET = {
     "Sec-Fetch-User": None,
 }
 HEADERS_HTML = {
-    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
     "upgrade-insecure-requests": "1",
+    "priority": "u=0, i",
+    "sec-fetch-site": "none",
     "sec-fetch-mode": "navigate",
+    "sec-fetch-user": "?1",
     "sec-fetch-dest": "document",
 }
+
+PIXEL_KEYS = [
+    "google_ads_muse",
+    "google_floodlight_muse_campaign_manager",
+    "google_floodlight_muse_dv360",
+    "snapchat_muse",
+    "tiktok_muse",
+]
 
 # accept-tos 携带的披露文案（日文区）。不同 nux_type 对应不同文案。
 DISCLOSURE_TEXT_JA = (
@@ -50,6 +64,15 @@ DISCLOSURE_TEXT_JA = (
     "これには利用者の権利と責任に関する重要な情報が含まれています。"
     "プライバシーに関するMuseのアプローチについて詳しくはMuseプライバシーポリシーをご覧ください。"
 )
+
+
+def accept_language_header(lang):
+    low = (lang or "ja").strip().lower()
+    if low in ("ja", "ja-jp"):
+        return "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7"
+    if low in ("en", "en-us"):
+        return "en-US,en;q=0.9"
+    return lang
 
 
 class MuseError(RuntimeError):
@@ -69,7 +92,10 @@ class MuseClient:
                             timeout=timeout)
         self.csrf = None
         self.waterfall_id = _uuid()
+        self.landing_url = BASE + "/"
         self.home_url = BASE + "/"
+        self.post_reg_url = None
+        self.post_reg_html = None
         self.requires_name = None
         self.tos_version = None
         self.account_id = None
@@ -77,9 +103,7 @@ class MuseClient:
     # ---------- 基础设施 ----------
 
     def _accept_language(self):
-        if self.lang == "ja":
-            return "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7"
-        return self.lang
+        return accept_language_header(self.lang)
 
     def _region(self):
         if "-" in self.lang:
@@ -105,6 +129,9 @@ class MuseClient:
         except Exception:
             return {}
 
+    def cookie_summary(self):
+        return sorted({(c.name, c.domain) for c in self.s.cookies.jar})
+
     def close(self):
         try:
             self.s.close()
@@ -116,11 +143,21 @@ class MuseClient:
     def open_home(self):
         r = self.s.get(BASE + "/", impersonate=self.fp,
                        headers=self._h(HEADERS_HTML))
-        self.s.cookies.set("wd", "1440x900", domain="muse.ai", path="/")
-        self.s.cookies.set("dpr", "2", domain="muse.ai", path="/")
+        if getattr(r, "url", None):
+            self.landing_url = r.url
+            self.home_url = r.url
+        self.s.cookies.set("wd", "1440x900", domain=".muse.ai", path="/")
+        self.s.cookies.set("dpr", "2", domain=".muse.ai", path="/")
         try:
             self.s.get(BASE + "/api/consent/status", impersonate=self.fp,
                        headers=self._h(HEADERS_GET))
+        except Exception:
+            pass
+        try:
+            self.s.post(BASE + "/api/marketing/x-marketing/pixel/context",
+                        impersonate=self.fp,
+                        headers=self._h(HEADERS_JSON),
+                        data=json.dumps({"pixel_keys": PIXEL_KEYS}))
         except Exception:
             pass
         return r
@@ -133,14 +170,22 @@ class MuseClient:
                         data=payload)
         if r.status_code != 201:
             raise MuseError(f"restart {r.status_code}: {r.text[:120]}")
-        self.csrf = self._json(r).get("csrf_token")
+        data = self._json(r)
+        self.csrf = data.get("csrf_token")
         if not self.csrf:
             raise MuseError("restart 未返回 csrf_token")
-        try:
-            self.s.post(BASE + "/api/auth/native/login-options", impersonate=self.fp,
-                        headers=self._auth_headers(), data="{}")
-        except Exception:
-            pass
+        if data.get("flow_state") == "new":
+            self.s.post(
+                BASE + "/api/auth/native/start",
+                impersonate=self.fp,
+                headers=self._h(HEADERS_JSON, {
+                    "X-Hatch-CSRF-Token": self.csrf,
+                    "X-Hatch-Waterfall-Id": self.waterfall_id,
+                }),
+                data="{}",
+            )
+        # 真实前端在 restart 后通过 history.replaceState 剥离 ?aymh_complete=1
+        self.home_url = BASE + "/"
         return self.csrf
 
     def _auth_headers(self):
@@ -198,10 +243,65 @@ class MuseClient:
         r = self.s.post(BASE + "/api/auth/native/register-completion", impersonate=self.fp,
                         headers=self._auth_headers(), data=json.dumps(body))
         if r.status_code != 200:
-            raise MuseError(f"register-completion {r.status_code}: {r.text[:120]}")
+            raise MuseError(f"register-completion {r.status_code}: {r.text[:160]}")
         data = self._json(r)
         self.account_id = (data.get("auth_meta_session") or {}).get("frl_account_id")
         return data
+
+    def bootstrap_session(self, frl_access_token):
+        """复现前端注册成功后的 auth.meta.com/hatch/session/bootstrap/ 表单跳转同步"""
+        if not frl_access_token:
+            return None
+        cur_url = "https://auth.meta.com/hatch/session/bootstrap/"
+        h = {
+            "accept": HEADERS_HTML["accept"],
+            "content-type": "application/x-www-form-urlencoded",
+            "origin": BASE,
+            "referer": BASE + "/",
+            "accept-language": self._accept_language(),
+            "upgrade-insecure-requests": "1",
+            "priority": "u=0, i",
+            "sec-fetch-site": "cross-site",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-user": "?1",
+            "sec-fetch-dest": "document",
+        }
+        r = self.s.post(
+            cur_url,
+            impersonate=self.fp,
+            headers=h,
+            data={"frl_access_token": frl_access_token},
+            allow_redirects=False,
+        )
+        for _ in range(10):
+            if r.status_code not in (301, 302, 303, 307, 308):
+                break
+            loc = r.headers.get("location")
+            if not loc:
+                break
+            next_url = urljoin(cur_url, loc)
+            same = urlparse(next_url).netloc == urlparse(cur_url).netloc
+            gh = self._h(HEADERS_HTML, {
+                "sec-fetch-site": "same-origin" if same else "cross-site",
+            })
+            r = self.s.get(
+                next_url,
+                impersonate=self.fp,
+                headers=gh,
+                allow_redirects=False,
+            )
+            cur_url = next_url
+        self.post_reg_url = getattr(r, "url", None) or cur_url
+        self.post_reg_html = r.text
+        self.home_url = BASE + "/"
+        return r
+
+    def is_geo_gated(self, html=None):
+        raw = html if html is not None else (self.post_reg_html or "")
+        if not raw:
+            return None
+        m = re.search(r'"isGeoGated"\s*:\s*(true|false)', raw.replace('\\"', '"'))
+        return (m.group(1) == "true") if m else None
 
     def session_cookie(self, name="hatch_sess"):
         for c in self.s.cookies.jar:
@@ -237,9 +337,12 @@ class MuseClient:
 
     def wake_vm(self):
         """必须调用，否则兑换会返回误导性的 invalid"""
-        r = self.s.get(BASE + "/?aymh_complete=1", impersonate=self.fp,
-                       headers=self._h(HEADERS_HTML))
-        m = re.search(r'vmId[\\"]*:[\\"]*([0-9a-fA-F-]{36})', r.text)
+        pat = r'(?:vmId|vm_id)[\\"]*:[\\"]*([0-9a-fA-F-]{36})'
+        m = re.search(pat, self.post_reg_html or "")
+        if not m:
+            r = self.s.get(BASE + "/?aymh_complete=1", impersonate=self.fp,
+                           headers=self._h(HEADERS_HTML))
+            m = re.search(pat, r.text)
         if not m:
             return None
         vm_id = m.group(1)
@@ -255,19 +358,25 @@ class MuseClient:
         return self.s.post(BASE + "/api/hatch/stateful-sharing", impersonate=self.fp,
                            headers=self._h(HEADERS_JSON), data="")
 
+    def waitlist(self, source="hatch_web"):
+        return self.s.post(BASE + "/api/hatch/waitlist", impersonate=self.fp,
+                           headers=self._h(HEADERS_JSON),
+                           data=json.dumps({"source": source}))
+
     # ---------- 兑换 ----------
 
     def redeem(self, code):
         """
         兑换邀请码。返回 (ok, reason)。
-          reason: redeemed | already_redeemed | used_up | invalid
+          reason: redeemed | pending | already_redeemed | used_up | invalid
         """
         r = self.s.post(BASE + "/api/hatch/invite-code/redeem", impersonate=self.fp,
                         headers=self._h(HEADERS_JSON),
-                        data=json.dumps({"code": code, "supportsRedemptionStatus": True}))
+                        data=json.dumps({"code": code, "supportsPendingRedemption": True}))
         data = self._json(r)
-        if r.status_code == 200 and (data.get("success") is True or data.get("redemptionStatus") == "redeemed"):
-            return True, "redeemed"
+        if r.status_code == 200 and data.get("success") is True:
+            status = data.get("redemptionStatus") or "redeemed"
+            return status != "pending", status
         return False, data.get("reason") or f"http-{r.status_code}"
 
     def scratch_code(self):

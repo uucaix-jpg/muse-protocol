@@ -9,14 +9,19 @@ import json
 import random
 import time
 
-BASE = "https://muse.ai"
+from musepy.client import BASE, accept_language_header
 
 
 def _ms():
     return int(time.time() * 1000)
 
 
-def interaction(uri, action_type, action_target, event_name, meta=None):
+def _device_locale(lang):
+    code = (lang or "ja").strip().split(",")[0].split("-")[0].lower()
+    return code or "ja"
+
+
+def interaction(uri, action_type, action_target, event_name, meta=None, device_locale="ja"):
     m = {"surface": "onboarding", "result": "success",
          "resolution_mode": "blocking", "resolved_destination": "main_app"}
     if meta:
@@ -28,13 +33,13 @@ def interaction(uri, action_type, action_target, event_name, meta=None):
         "action_type": action_type,
         "action_target": action_target,
         "event_name": event_name,
-        "device_locale": "ja",
+        "device_locale": device_locale,
     }
     return {"event": "hatch_web_interaction", "timeInMs": _ms(), "rate": 1,
             "payload": json.dumps(payload, separators=(",", ":"))}
 
 
-def impression(uri, surface, subsurface, entry_point, extra=None):
+def impression(uri, surface, subsurface, entry_point, extra=None, device_locale="ja"):
     m = {"surface": surface, "subsurface": subsurface, "entry_point": entry_point}
     if extra:
         m.update(extra)
@@ -45,7 +50,7 @@ def impression(uri, surface, subsurface, entry_point, extra=None):
         "action_type": "one_px_impression",
         "action_target": subsurface + "_ready",
         "event_name": subsurface + "_ready_impression",
-        "device_locale": "ja",
+        "device_locale": device_locale,
     }
     return {"event": "hatch_web_impression", "timeInMs": _ms(), "rate": 1,
             "payload": json.dumps(payload, separators=(",", ":"))}
@@ -75,18 +80,21 @@ def perf(uri, nav_type="navigate", seconds=None):
             "payload": json.dumps(payload, separators=(",", ":"))}
 
 
-def send(session, impersonate, lang, session_id, events):
+def send(session, impersonate, lang, session_id, events, referer=BASE + "/", app_id=None):
     """发送一批事件；失败静默"""
     if not events:
         return None
     body = {"sessionId": session_id, "user": {"kind": "loggedOut"},
             "machineId": "not_set", "events": events}
+    if app_id:
+        body = {"appId": app_id, **body}
     h = {
         "accept": "*/*",
         "content-type": "application/json",
         "origin": BASE,
-        "referer": BASE + "/",
-        "accept-language": "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7" if lang == "ja" else lang,
+        "referer": referer or (BASE + "/"),
+        "accept-language": accept_language_header(lang),
+        "priority": "u=1, i",
         "sec-fetch-site": "same-origin",
         "sec-fetch-mode": "cors",
         "sec-fetch-dest": "empty",

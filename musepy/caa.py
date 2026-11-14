@@ -9,27 +9,33 @@ import json
 import time
 import uuid
 
-BASE = "https://muse.ai"
+from musepy.client import BASE, accept_language_header
+
 T_LOGIN = "caa_login_client_events_rl"
 T_ACQ = "caa_acquisition_client_events_rl"
 
 
 class Caa:
-    def __init__(self, impersonate, lang, waterfall_id=None):
+    def __init__(self, impersonate, lang, waterfall_id=None, referer=BASE + "/", activation_source=None):
         self.fp = impersonate
         self.lang = lang
         self.wid = waterfall_id or str(uuid.uuid4())
+        self.referer = referer
+        self.activation_source = activation_source
         self.sent = 0
 
     def _send(self, session, events):
         if not events:
             return None
+        payload = {"events": events}
+        if self.activation_source:
+            payload["activation_source"] = self.activation_source
         h = {
             "accept": "*/*",
             "content-type": "application/json",
             "origin": BASE,
-            "referer": BASE + "/",
-            "accept-language": "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7" if self.lang == "ja" else self.lang,
+            "referer": self.referer or (BASE + "/"),
+            "accept-language": accept_language_header(self.lang),
             "priority": "u=4, i",
             "sec-fetch-site": "same-origin",
             "sec-fetch-mode": "cors",
@@ -39,7 +45,7 @@ class Caa:
         }
         try:
             r = session.post(BASE + "/api/auth/caa-events", impersonate=self.fp,
-                             headers=h, data=json.dumps({"events": events}, separators=(",", ":")))
+                             headers=h, data=json.dumps(payload, separators=(",", ":")))
             self.sent += 1
             return r
         except Exception:
@@ -47,32 +53,44 @@ class Caa:
 
     # ---- 联系点页 ----
 
-    def page_shown(self, s):
-        return self._send(s, [{
+    def _ev_page_shown(self):
+        return {
             "table": T_LOGIN, "event_name": "contactpoint_page_shown",
             "event_category": "contactpoint_page_interaction", "event_flow": "login_manual",
             "event_step": "contactpoint", "extra_client_data": {"is_native": "1"},
-            "waterfall_id": self.wid, "client_time_ms": _ms()}])
+            "waterfall_id": self.wid, "client_time_ms": _ms(),
+        }
 
-    def focus(self, s):
-        return self._send(s, [{
+    def _ev_focus(self):
+        return {
             "table": T_LOGIN, "event_name": "contactpoint_focus",
             "event_category": "contactpoint_page_interaction", "event_flow": "login_manual",
             "event_step": "contactpoint", "extra_client_data": {"is_native": "1"},
-            "waterfall_id": self.wid, "client_time_ms": _ms()}])
+            "waterfall_id": self.wid, "client_time_ms": _ms(),
+        }
 
-    def continue_clicked(self, s):
-        return self._send(s, [{
+    def _ev_continue_clicked(self):
+        return {
             "table": T_LOGIN, "event_name": "contactpoint_continue_clicked",
             "event_category": "contactpoint_page_interaction", "event_flow": "login_manual",
             "event_step": "contactpoint", "contact_point_type": "EMAIL_ADDRESS",
             "extra_client_data": {"is_native": "1"},
-            "waterfall_id": self.wid, "client_time_ms": _ms()}])
+            "waterfall_id": self.wid, "client_time_ms": _ms(),
+        }
+
+    def page_shown(self, s):
+        return self._send(s, [self._ev_page_shown()])
+
+    def focus(self, s):
+        return self._send(s, [self._ev_focus()])
+
+    def continue_clicked(self, s):
+        return self._send(s, [self._ev_continue_clicked()])
 
     # ---- 注册漏斗 ----
 
-    def registration_start(self, s):
-        return self._send(s, [
+    def _evs_registration_start(self):
+        return [
             {"table": T_LOGIN, "event_name": "password_saving_start", "event_category": "impression",
              "event_flow": "ntm", "event_step": "otp",
              "extra_client_data": {"is_native": "1", "is_checked": "1"},
@@ -88,7 +106,13 @@ class Caa:
              "extra_client_data": {"is_native": "1", "flow_source": "server"},
              "event_flow": "ntm", "entry_point": "login_home",
              "waterfall_id": self.wid, "client_time_ms": _ms()},
-        ])
+        ]
+
+    def registration_start(self, s):
+        return self._send(s, self._evs_registration_start())
+
+    def continue_and_start(self, s):
+        return self._send(s, [self._ev_continue_clicked(), *self._evs_registration_start()])
 
     def otp_typed(self, s):
         return self._send(s, [{
@@ -99,21 +123,32 @@ class Caa:
             "event_flow": "ntm", "entry_point": "login_home",
             "waterfall_id": self.wid, "client_time_ms": _ms()}])
 
-    def otp_success(self, s):
-        return self._send(s, [{
+    def _ev_otp_success(self):
+        return {
             "table": T_ACQ, "event_name": "confirmation_flow_state", "state": "confirmation_success",
             "event_category": "confirmation_funnel", "event_step": "confirmation",
             "contact_point_type": "EMAIL_ADDRESS",
             "extra_client_data": {"is_native": "1", "flow_source": "server"},
             "event_flow": "ntm", "entry_point": "login_home",
-            "waterfall_id": self.wid, "client_time_ms": _ms()}])
+            "waterfall_id": self.wid, "client_time_ms": _ms(),
+        }
 
-    def birthday_start(self, s):
-        return self._send(s, [{
+    def _ev_birthday_start(self):
+        return {
             "table": T_ACQ, "event_name": "registration_flow_state", "state": "birthday_start",
             "event_category": "registration_funnel", "event_step": "birthday", "event_flow": "ntm",
             "entry_point": "login_home", "extra_client_data": {"is_native": "1"},
-            "waterfall_id": self.wid, "client_time_ms": _ms()}])
+            "waterfall_id": self.wid, "client_time_ms": _ms(),
+        }
+
+    def otp_success(self, s):
+        return self._send(s, [self._ev_otp_success()])
+
+    def birthday_start(self, s):
+        return self._send(s, [self._ev_birthday_start()])
+
+    def otp_and_birthday_start(self, s):
+        return self._send(s, [self._ev_otp_success(), self._ev_birthday_start()])
 
     def birthday_next(self, s):
         return self._send(s, [
