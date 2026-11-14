@@ -236,3 +236,18 @@ def random_dob(min_year=1970, max_year=1999):
     return (f"{random.randint(min_year, max_year)}-"
             f"{random.randint(1, 12):02d}-"
             f"{random.randint(1, 28):02d}")
+
+
+_FIRST_NAMES = (
+    "Alex", "Liam", "Noah", "Ethan", "Lucas", "Mason", "Logan", "James",
+    "Emma", "Olivia", "Sophia", "Chloe", "Grace", "Hannah", "Emily", "Mia",
+)
+_LAST_NAMES = (
+    "Smith", "Miller", "Davis", "Wilson", "Clark", "Taylor", "Moore", "Walker",
+    "Hall", "Young", "Allen", "King", "Wright", "Scott", "Green", "Baker",
+)
+
+
+def random_name():
+    return random.choice(_FIRST_NAMES), random.choice(_LAST_NAMES)
+

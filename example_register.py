@@ -9,7 +9,7 @@ import uuid
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from musepy import caa, falco
-from musepy.client import MuseClient, MuseError, random_dob
+from musepy.client import MuseClient, MuseError, random_dob, random_name
 from musepy.otp_worker import WorkerOtpClient, random_email
 
 
@@ -93,8 +93,9 @@ def main():
     print("[4] 校验验证码")
     c.confirm_otp(code)
 
-    first = cfg.get("first_name") or "三郎"    # 名
-    last = cfg.get("last_name") or "近藤"      # 姓
+    rand_first, rand_last = random_name()
+    first = (cfg.get("first_name") or "").strip() or rand_first
+    last = (cfg.get("last_name") or "").strip() or rand_last
     dob = cfg.get("date_of_birth") or random_dob()
 
     if cfg.get("send_caa", True):
@@ -103,7 +104,7 @@ def main():
         time.sleep(3)
         funnel.birthday_next(c.s)
 
-    print(f"[5] 完成注册  {last} {first}  {dob}")
+    print(f"[5] 完成注册  {first} {last}  {dob}")
     data = c.register_completion(dob, first, last)
     uid = (data.get("auth_meta_session") or {}).get("frl_account_id")
     print(f"    account_id = {uid}")
