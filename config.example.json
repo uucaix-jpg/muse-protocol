@@ -1,6 +1,8 @@
 {
   "email": "your-mailbox@example.com",
   "email_domain": "",
+  "email_prefix": "muse",
+  "email_start": 1,
   "proxy": "http://user:pass@host:port",
   "invite_code": "",
   "lang": "ja",

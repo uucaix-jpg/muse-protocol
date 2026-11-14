@@ -3,3 +3,4 @@ config.json
 __pycache__/
 .venv/
 accounts.jsonl
+.email_seq.json

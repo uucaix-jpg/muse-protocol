@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from musepy import caa, falco
 from musepy.client import MuseClient, MuseError, random_dob, random_name
-from musepy.otp_worker import WorkerOtpClient, random_email
+from musepy.otp_worker import WorkerOtpClient, next_email
 
 
 def load_config(path="config.json"):
@@ -26,7 +26,9 @@ def resolve_email(cfg):
         return email
     domain = (cfg.get("email_domain") or "").strip()
     if domain:
-        return random_email(domain)
+        prefix = cfg.get("email_prefix", "muse")
+        start = cfg.get("email_start", 1)
+        return next_email(domain, prefix=prefix, start=start)
     raise SystemExit("请在 config.json 中填写 email 或 email_domain")
 
 

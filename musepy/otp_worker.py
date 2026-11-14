@@ -1,15 +1,68 @@
 """Cloudflare Email Worker 自动接码客户端。"""
 
-import random
-import string
+from datetime import datetime
+import json
+import os
+import re
 import time
 
 from curl_cffi import requests as cr
 
 
-def random_email(domain, prefix="muse"):
-    suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
-    return f"{prefix}_{suffix}@{domain.lstrip('@')}"
+def next_email(
+    domain,
+    prefix="muse",
+    start=1,
+    accounts_path="accounts.jsonl",
+    seq_path=".email_seq.json",
+):
+    domain = domain.lstrip("@").strip()
+    prefix = "muse" if prefix is None else str(prefix).strip()
+    today = datetime.now().strftime("%y%m%d")
+    key = f"{prefix}_{today}@{domain}"
+    pattern = re.compile(rf"^{re.escape(prefix)}{today}_(\d+)@{re.escape(domain)}$")
+
+    max_seq = max(0, int(start or 1) - 1)
+
+    if os.path.exists(accounts_path):
+        try:
+            with open(accounts_path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        email = json.loads(line).get("email", "")
+                    except Exception:
+                        continue
+                    m = pattern.match(email)
+                    if m:
+                        max_seq = max(max_seq, int(m.group(1)))
+        except Exception:
+            pass
+
+    seq_data = {}
+    if os.path.exists(seq_path):
+        try:
+            with open(seq_path, encoding="utf-8") as f:
+                seq_data = json.load(f) or {}
+            max_seq = max(max_seq, int(seq_data.get(key, 0)))
+        except Exception:
+            seq_data = {}
+
+    seq = max_seq + 1
+    seq_data[key] = seq
+    try:
+        with open(seq_path, "w", encoding="utf-8") as f:
+            json.dump(seq_data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+    return f"{prefix}{today}_{seq:02d}@{domain}"
+
+
+def random_email(domain, prefix="muse", start=1):
+    return next_email(domain, prefix=prefix, start=start)
 
 
 class WorkerOtpClient:
