@@ -34,8 +34,8 @@ HEADERS_GET = {
     "sec-fetch-dest": "empty",
 }
 HEADERS_HTML = {
-    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "sec-fetch-site": "same-origin",
+    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "upgrade-insecure-requests": "1",
     "sec-fetch-mode": "navigate",
     "sec-fetch-dest": "document",
 }
@@ -55,7 +55,7 @@ class MuseError(RuntimeError):
 class MuseClient:
     """一个账号 = 一个 Session（一个出口 IP）"""
 
-    def __init__(self, proxy=None, impersonate="chrome131", lang="ja", timeout=30):
+    def __init__(self, proxy=None, impersonate="chrome145", lang="ja", timeout=30):
         self.fp = impersonate
         self.lang = lang
         self.proxy = proxy
@@ -65,12 +65,32 @@ class MuseClient:
                             timeout=timeout)
         self.csrf = None
         self.waterfall_id = _uuid()
+        self.home_url = BASE + "/"
+        self.requires_name = None
+        self.tos_version = None
+        self.account_id = None
 
     # ---------- 基础设施 ----------
 
+    def _accept_language(self):
+        if self.lang == "ja":
+            return "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7"
+        return self.lang
+
+    def _region(self):
+        if "-" in self.lang:
+            part = self.lang.split("-", 1)[1].split(",")[0].split(";")[0].strip()
+            if len(part) == 2 and part.isalpha():
+                return part.upper()
+        if self.lang.lower().startswith("ja"):
+            return "JP"
+        return None
+
     def _h(self, base, extra=None):
         h = dict(base)
-        h["accept-language"] = self.lang
+        if "referer" in h:
+            h["referer"] = self.home_url
+        h["accept-language"] = self._accept_language()
         if extra:
             h.update(extra)
         return h
@@ -90,13 +110,25 @@ class MuseClient:
     # ---------- 注册流程 ----------
 
     def open_home(self):
-        return self.s.get(BASE + "/", impersonate=self.fp,
-                          headers=self._h(HEADERS_HTML))
+        r = self.s.get(BASE + "/", impersonate=self.fp,
+                       headers=self._h(HEADERS_HTML))
+        if r.url:
+            self.home_url = r.url
+        self.s.cookies.set("wd", "1440x900", domain="muse.ai", path="/")
+        self.s.cookies.set("dpr", "2", domain="muse.ai", path="/")
+        try:
+            self.s.get(BASE + "/api/consent/status", impersonate=self.fp,
+                       headers=self._h(HEADERS_GET))
+        except Exception:
+            pass
+        return r
 
     def restart(self, resume=False):
         """开启注册流程，返回 csrf_token"""
+        payload = json.dumps({"resume": True}) if resume else "{}"
         r = self.s.post(BASE + "/api/auth/native/restart", impersonate=self.fp,
-                        headers=self._h(HEADERS_JSON), data=json.dumps({"resume": resume}))
+                        headers=self._h(HEADERS_JSON, {"X-Hatch-Waterfall-Id": self.waterfall_id}),
+                        data=payload)
         if r.status_code != 201:
             raise MuseError(f"restart {r.status_code}: {r.text[:120]}")
         self.csrf = self._json(r).get("csrf_token")
@@ -112,9 +144,13 @@ class MuseClient:
             h["X-Hatch-Caa-Reg-Entry-Point"] = "login_home"
         return h
 
-    def send_otp(self, email):
+    def send_otp(self, email, region=None):
+        body = {"contact_point": email}
+        reg = region or self._region()
+        if reg:
+            body["region"] = reg
         r = self.s.post(BASE + "/api/auth/native/send-otp", impersonate=self.fp,
-                        headers=self._auth_headers(), data=json.dumps({"contact_point": email}))
+                        headers=self._auth_headers(), data=json.dumps(body))
         if r.status_code not in (200, 201):
             raise MuseError(f"send-otp {r.status_code}: {r.text[:120]}")
         return self._json(r)
@@ -128,22 +164,30 @@ class MuseClient:
                                          "supports_muse_link_transparency": True}))
         if r.status_code != 200:
             raise MuseError(f"confirm-otp {r.status_code}: {r.text[:120]}")
-        return self._json(r)
+        data = self._json(r)
+        self.requires_name = bool(data.get("requires_name"))
+        tos_ver = (data.get("tos") or {}).get("content_version")
+        if tos_ver:
+            self.tos_version = tos_ver
+        return data
 
-    def register_completion(self, date_of_birth, first_name, last_name, remember_device=True):
+    def register_completion(self, date_of_birth, first_name=None, last_name=None, remember_device=True):
         """
         完成注册。注意字段语义：
           first_name = 名（given name）
           last_name  = 姓（family name）
+        仅当服务端 confirm-otp 返回 requires_name=true 时才需要传姓名。
         生日早于约 18 年前会被服务端拒绝（403）。
         """
         body = {
             "date_of_birth": date_of_birth,
-            "first_name": first_name,
-            "last_name": last_name,
-            "tos_content_version": TOS_VERSION,
+            "tos_content_version": self.tos_version or TOS_VERSION,
             "remember_device": remember_device,
         }
+        need_name = True if self.requires_name is None else self.requires_name
+        if need_name and first_name and last_name:
+            body["first_name"] = first_name
+            body["last_name"] = last_name
         r = self.s.post(BASE + "/api/auth/native/register-completion", impersonate=self.fp,
                         headers=self._auth_headers(), data=json.dumps(body))
         if r.status_code != 200:

@@ -48,7 +48,7 @@ def main():
     if worker_cfg.get("url") and worker_cfg.get("api_key"):
         otp_client = WorkerOtpClient(worker_cfg["url"], worker_cfg["api_key"])
 
-    c = MuseClient(proxy=proxy, impersonate=cfg.get("impersonate", "chrome131"),
+    c = MuseClient(proxy=proxy, impersonate=cfg.get("impersonate", "chrome145"),
                    lang=cfg.get("lang", "ja"))
 
     print(f"[1] 打开首页  {email}")
@@ -56,6 +56,12 @@ def main():
 
     print("[2] 重启注册流程")
     c.restart()
+
+    falco_sid = str(uuid.uuid4())
+    if cfg.get("send_falco", True):
+        falco.send(c.s, c.fp, c.lang, falco_sid, [
+            falco.perf(c.home_url),
+        ])
 
     # ---- 可选的漏斗埋点 ----
     funnel = caa.Caa(c.fp, c.lang, waterfall_id=c.waterfall_id)
@@ -104,7 +110,8 @@ def main():
         time.sleep(3)
         funnel.birthday_next(c.s)
 
-    print(f"[5] 完成注册  {first} {last}  {dob}")
+    name_label = f"{first} {last}" if c.requires_name else "(无需姓名)"
+    print(f"[5] 完成注册  {name_label}  {dob}")
     data = c.register_completion(dob, first, last)
     uid = (data.get("auth_meta_session") or {}).get("frl_account_id")
     print(f"    account_id = {uid}")
@@ -115,8 +122,7 @@ def main():
 
     # ---- falco 埋点（可选）----
     if cfg.get("send_falco", True):
-        falco.send(c.s, c.fp, c.lang, str(uuid.uuid4()), [
-            falco.perf("https://muse.ai/"),
+        falco.send(c.s, c.fp, c.lang, falco_sid, [
             falco.interaction("https://muse.ai/", "page_load", "main_app", "page_load"),
         ])
 
