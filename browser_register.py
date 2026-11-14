@@ -50,7 +50,7 @@ def main():
     first = (cfg.get("first_name") or "").strip() or rand_first
     last = (cfg.get("last_name") or "").strip() or rand_last
     dob = (cfg.get("date_of_birth") or "").strip() or random_dob()
-    dob_year = dob.split("-")[0]
+    dob_year, dob_month, dob_day = dob.split("-")
 
     worker_cfg = cfg.get("otp_worker") or {}
     otp_client = None
@@ -59,6 +59,7 @@ def main():
 
     state = {
         "uid": None,
+        "confirm_status": None,
         "reg_status": None,
         "reg_body": None,
         "confirm_data": {},
@@ -78,7 +79,7 @@ def main():
 
         browser = p.chromium.launch(**launch_kwargs)
         context = browser.new_context(
-            locale="zh-CN",
+            locale=cfg.get("browser_locale", "zh-CN"),
             viewport={"width": 1440, "height": 900},
             device_scale_factor=2,
             user_agent=(
@@ -110,7 +111,8 @@ def main():
         page.route("**/api/auth/native/register-completion", on_route)
 
         def on_response(resp):
-            if "/api/auth/native/confirm-otp" in resp.url and resp.status == 200:
+            if "/api/auth/native/confirm-otp" in resp.url:
+                state["confirm_status"] = resp.status
                 try:
                     state["confirm_data"] = resp.json() or {}
                 except Exception:
@@ -143,6 +145,9 @@ def main():
         time.sleep(0.5)
         page.locator('form button[type="submit"]').first.click()
 
+        # OTP 页面的真实输入框带 sr-only，等待可见的 6 格验证码区域
+        page.locator('[data-slot="pin-digit"]').first.wait_for(state="visible", timeout=30000)
+
         if otp_client:
             print("    正在通过 Cloudflare Email Worker 自动等待验证码...")
             code, _ = otp_client.poll_otp(email, after_ms=sent_after_ms, wait_seconds=90, interval=2.0)
@@ -154,13 +159,12 @@ def main():
             code = input("输入收到的 6 位验证码: ").strip()
 
         print("[3] 填写并校验验证码")
-        otp_input = page.locator('input[autocomplete="one-time-code"], input[inputmode="numeric"]').first
-        otp_input.wait_for(state="visible", timeout=30000)
-        otp_input.click()
+        page.locator('[data-slot="pin-digit"]').first.click()
         page.keyboard.type(code, delay=80)
 
-        # 等待进入生日/姓名页
-        page.wait_for_timeout(2500)
+        # 等待确认并跳转至生日（和可选姓名）页面
+        page.locator('button[role="combobox"]').first.wait_for(state="visible", timeout=30000)
+
         given_input = page.locator('input[autocomplete="given-name"]')
         if given_input.count() > 0 and given_input.first.is_visible():
             print(f"[4] 填写姓名与生日  {first} {last}  {dob}")
@@ -169,28 +173,44 @@ def main():
         else:
             print(f"[4] 填写生日  {dob}")
 
-        # 尝试在下拉框中选择年份（同时已通过 route 拦截保底注入 dob）
+        # 分别设置生日下拉框（年 / 月 / 日）
         try:
             combos = page.locator('button[role="combobox"]')
             for i in range(combos.count()):
-                txt = combos.nth(i).inner_text()
-                if any(y in txt for y in ("2026", "2025", "2024")):
+                txt = combos.nth(i).inner_text().strip()
+                digits = "".join(ch for ch in txt if ch.isdigit())
+                if len(digits) == 4 and int(digits) >= 1900:
                     combos.nth(i).click()
-                    opt = page.locator(f'[role="option"]:has-text("{dob_year}")').first
-                    if opt.is_visible(timeout=2000):
-                        opt.click()
-                    else:
-                        page.keyboard.press("Escape")
+                    page.get_by_role("option", name=dob_year, exact=True).click(timeout=5000)
+                    break
+            for i in range(combos.count()):
+                txt = combos.nth(i).inner_text().strip()
+                digits = "".join(ch for ch in txt if ch.isdigit())
+                if digits and len(digits) <= 2 and "月" not in txt and int(digits) <= 31:
+                    combos.nth(i).click()
+                    page.get_by_role("option", name=str(int(dob_day)), exact=True).click(timeout=5000)
+                    break
+            for i in range(combos.count()):
+                txt = combos.nth(i).inner_text().strip()
+                digits = "".join(ch for ch in txt if ch.isdigit())
+                is_year = len(digits) == 4 and int(digits) >= 1900
+                is_day = bool(digits) and len(digits) <= 2 and "月" not in txt and int(digits) <= 31
+                if not is_year and not is_day:
+                    combos.nth(i).click()
+                    page.locator('[role="option"]').nth(int(dob_month) - 1).click(timeout=5000)
                     break
         except Exception:
-            pass
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
 
-        page.wait_for_timeout(1000)
         print("[5] 提交完成注册")
-        page.locator('form button[type="submit"]').first.click()
+        submit_btn = page.locator('form button[type="submit"]').first
+        submit_btn.click(timeout=30000)
 
         # 如果弹出条款二次确认框，点击确认按钮
-        for _ in range(20):
+        for _ in range(30):
             if state["reg_status"] is not None:
                 break
             dialog_btn = page.locator('[role="dialog"] button[type="button"], [role="alertdialog"] button').last
