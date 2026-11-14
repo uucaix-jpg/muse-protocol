@@ -60,7 +60,7 @@ def main():
     falco_sid = str(uuid.uuid4())
     if cfg.get("send_falco", True):
         falco.send(c.s, c.fp, c.lang, falco_sid, [
-            falco.perf(c.home_url),
+            falco.impression(c.home_url, "login", "login_home", "login_home"),
         ])
 
     # ---- 可选的漏斗埋点 ----
