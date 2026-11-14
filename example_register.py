@@ -6,10 +6,11 @@ import sys
 import time
 import uuid
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from musepy import caa, falco
 from musepy.client import MuseClient, MuseError, random_dob
+from musepy.otp_worker import WorkerOtpClient, random_email
 
 
 def load_config(path="config.json"):
@@ -19,13 +20,33 @@ def load_config(path="config.json"):
         return json.load(f)
 
 
+def resolve_email(cfg):
+    email = (cfg.get("email") or "").strip()
+    if email and email != "your-mailbox@example.com":
+        return email
+    domain = (cfg.get("email_domain") or "").strip()
+    if domain:
+        return random_email(domain)
+    raise SystemExit("请在 config.json 中填写 email 或 email_domain")
+
+
+def save_account(record, path="accounts.jsonl"):
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
 def main():
     cfg = load_config()
 
-    email = cfg["email"]
+    email = resolve_email(cfg)
     proxy = cfg.get("proxy") or None
     invite_code = cfg.get("invite_code") or ""
     otp_file = cfg.get("otp_file")  # 可选：从文件读取当前验证码
+
+    worker_cfg = cfg.get("otp_worker") or {}
+    otp_client = None
+    if worker_cfg.get("url") and worker_cfg.get("api_key"):
+        otp_client = WorkerOtpClient(worker_cfg["url"], worker_cfg["api_key"])
 
     c = MuseClient(proxy=proxy, impersonate=cfg.get("impersonate", "chrome131"),
                    lang=cfg.get("lang", "ja"))
@@ -37,7 +58,7 @@ def main():
     c.restart()
 
     # ---- 可选的漏斗埋点 ----
-    funnel = caa.Caa(c.fp, c.lang)
+    funnel = caa.Caa(c.fp, c.lang, waterfall_id=c.waterfall_id)
     if cfg.get("send_caa", True):
         funnel.page_shown(c.s)
         time.sleep(2)
@@ -46,10 +67,25 @@ def main():
         funnel.continue_clicked(c.s)
         funnel.registration_start(c.s)
 
+    sent_after_ms = int(time.time() * 1000)
+    if otp_client:
+        otp_client.clear(email)
+
     print("[3] 发送验证码")
     c.send_otp(email)
 
-    code = otp_file and open(otp_file).read().strip() or input("输入收到的 6 位验证码: ").strip()
+    if otp_client:
+        print("    正在通过 Cloudflare Email Worker 自动等待验证码...")
+        code, _ = otp_client.poll_otp(email, after_ms=sent_after_ms, wait_seconds=90, interval=2.0)
+        if not code:
+            code = input("自动接码超时，请手动输入收到的 6 位验证码: ").strip()
+        else:
+            print(f"    自动获取到验证码 = {code}")
+    elif otp_file:
+        with open(otp_file, encoding="utf-8") as f:
+            code = f.read().strip()
+    else:
+        code = input("输入收到的 6 位验证码: ").strip()
 
     if cfg.get("send_caa", True):
         funnel.otp_typed(c.s)
@@ -89,7 +125,8 @@ def main():
         if c.is_live():
             break
         time.sleep(1.2)
-    print(f"    invite = {'200 活号' if c.is_live() else '401/403 无 hatch 权限'}")
+    live = c.is_live()
+    print(f"    invite = {'200 活号' if live else '401/403 无 hatch 权限'}")
 
     print("[7] 唤醒 VM")
     vm = c.wake_vm()
@@ -97,6 +134,7 @@ def main():
 
     c.stateful_sharing()
 
+    own = None
     print(f"[8] 兑换邀请码  {invite_code or '(未配置)'}")
     if invite_code:
         ok, reason = c.redeem(invite_code)
@@ -112,6 +150,18 @@ def main():
 
     sess = c.session_cookie()
     print(f"\nhatch_sess 长度 = {len(sess or '')}")
+
+    save_account({
+        "email": email,
+        "account_id": uid,
+        "live": live,
+        "vm_id": vm,
+        "redeemed_invite_code": invite_code or None,
+        "own_invite_code": own,
+        "hatch_sess": sess,
+        "created_at": int(time.time()),
+    })
+    print("已保存到 accounts.jsonl")
     c.close()
 
 

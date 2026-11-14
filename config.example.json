@@ -1,5 +1,6 @@
 {
   "email": "your-mailbox@example.com",
+  "email_domain": "",
   "proxy": "http://user:pass@host:port",
   "invite_code": "",
   "lang": "ja",
@@ -8,5 +9,9 @@
   "last_name": "近藤",
   "date_of_birth": "1993-11-14",
   "send_caa": true,
-  "send_falco": true
+  "send_falco": true,
+  "otp_worker": {
+    "url": "https://your-otp-worker.workers.dev",
+    "api_key": ""
+  }
 }

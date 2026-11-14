@@ -64,6 +64,7 @@ class MuseClient:
                             proxies={"http": proxy, "https": proxy} if proxy else None,
                             timeout=timeout)
         self.csrf = None
+        self.waterfall_id = _uuid()
 
     # ---------- 基础设施 ----------
 
@@ -107,7 +108,7 @@ class MuseClient:
         h = self._h(HEADERS_JSON)
         if self.csrf:
             h["X-Hatch-CSRF-Token"] = self.csrf
-            h["X-Hatch-Waterfall-Id"] = _uuid()
+            h["X-Hatch-Waterfall-Id"] = self.waterfall_id
             h["X-Hatch-Caa-Reg-Entry-Point"] = "login_home"
         return h
 
@@ -213,9 +214,9 @@ class MuseClient:
         r = self.s.post(BASE + "/api/hatch/invite-code/redeem", impersonate=self.fp,
                         headers=self._h(HEADERS_JSON),
                         data=json.dumps({"code": code, "supportsRedemptionStatus": True}))
-        if r.status_code == 200 and '"success":true' in r.text:
-            return True, "redeemed"
         data = self._json(r)
+        if r.status_code == 200 and (data.get("success") is True or data.get("redemptionStatus") == "redeemed"):
+            return True, "redeemed"
         return False, data.get("reason") or f"http-{r.status_code}"
 
     def scratch_code(self):
