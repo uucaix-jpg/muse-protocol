@@ -460,5 +460,121 @@ def main():
     print("已保存到 accounts.jsonl")
 
 
+def probe():
+    import re
+
+    cfg = load_config()
+    proxy = (cfg.get("proxy") or "").strip() or None
+    invite_code = (cfg.get("invite_code") or "").strip()
+
+    trace_domain = "muse.ai"
+    if os.path.exists(".last_browser_trace.json"):
+        print("=== .last_browser_trace.json ===")
+        with open(".last_browser_trace.json", encoding="utf-8") as f:
+            tr = json.load(f)
+        print("page_url:", tr.get("page_url"))
+        print("post_reg_navs:", tr.get("post_reg_navs"))
+        print("cookies:", tr.get("cookies"))
+        for ck in tr.get("cookies") or []:
+            if ck.get("name") == "hatch_sess" and ck.get("domain"):
+                trace_domain = ck["domain"]
+        for item in tr.get("trace", []):
+            hdrs = item.get("headers") or {}
+            xh = {k: v for k, v in hdrs.items() if k.startswith("x-") or k in ("referer", "origin", "accept-language")}
+            print(
+                f"  {item.get('status')} {item.get('method')} {item.get('url')} "
+                f"| sc={item.get('set_cookies')} | cks={item.get('cookie_names')} | h={xh}"
+            )
+            if item.get("post"):
+                print(f"      body={item['post'][:400]}")
+    else:
+        print("未找到 .last_browser_trace.json")
+
+    if not os.path.exists("accounts.jsonl"):
+        raise SystemExit("未找到 accounts.jsonl")
+    records = []
+    with open("accounts.jsonl", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    rec = next((r for r in reversed(records) if r.get("hatch_sess")), None)
+    if not rec:
+        raise SystemExit("accounts.jsonl 中没有带 hatch_sess 的记录")
+
+    print(f"\n=== 使用已保存会话探测: {rec.get('email')} (id={rec.get('account_id')}) ===")
+    with sync_playwright() as p:
+        launch_kwargs = {
+            "headless": True,
+            "args": ["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
+        }
+        if proxy:
+            launch_kwargs["proxy"] = {"server": proxy}
+        browser = p.chromium.launch(**launch_kwargs)
+        context = browser.new_context(
+            locale="ja-JP",
+            viewport={"width": 1440, "height": 900},
+            device_scale_factor=2,
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            ),
+        )
+        context.add_cookies([{
+            "name": "hatch_sess",
+            "value": rec["hatch_sess"],
+            "domain": trace_domain,
+            "path": "/",
+            "httpOnly": True,
+            "secure": True,
+            "sameSite": "Lax",
+        }])
+        page = context.new_page()
+        api_hits = []
+
+        def on_resp(resp):
+            if "/api/" in resp.url:
+                try:
+                    txt = resp.text()[:240]
+                except Exception:
+                    txt = ""
+                api_hits.append(f"{resp.request.method} {resp.url} -> {resp.status} {txt}")
+
+        page.on("response", on_resp)
+
+        routes = ["/", "/access", "/access/invite", "/access/terms", "/access/disclosure", "/access/waitlist"]
+        if invite_code:
+            routes.append(f"/invite/{invite_code}")
+
+        for path in routes:
+            api_hits.clear()
+            try:
+                page.goto("https://muse.ai" + path, wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(2000)
+                btns = [b.strip() for b in page.locator("button:visible").all_inner_texts() if b.strip()][:8]
+                txt = re.sub(r"\s+", " ", page.locator("body").inner_text()).strip()[:200]
+                html = page.content().replace('\\"', '"')
+                flags = re.findall(r'"(?:isGeoGated|state|waitlistState|admissionState|region|country|eligible|admitted|accessState)"\s*:\s*[^,}\]]+', html)
+                print(f"[GET {path}] -> {page.url} | btns={btns} | flags={flags[:12]} | text={txt}")
+                for h in api_hits:
+                    print(f"    api: {h}")
+            except Exception as e:
+                print(f"[GET {path}] ERR: {e}")
+
+        if invite_code:
+            res = browser_api(
+                page,
+                "POST",
+                "/api/hatch/invite-code/redeem",
+                {"code": invite_code, "supportsPendingRedemption": True},
+            )
+            print(f"[API redeem(supportsPendingRedemption)] -> {res['status']} {res['text'][:240]}")
+
+        browser.close()
+
+
 if __name__ == "__main__":
-    main()
+    if "--probe" in sys.argv:
+        probe()
+    else:
+        main()
