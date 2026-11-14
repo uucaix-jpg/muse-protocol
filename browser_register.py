@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from playwright.sync_api import sync_playwright
 
-from musepy.client import MuseClient, random_dob, random_name
+from musepy.client import DISCLOSURE_TEXT_JA, random_dob, random_name
 from musepy.otp_worker import WorkerOtpClient, next_email
 
 
@@ -40,7 +40,28 @@ def save_account(record, path="accounts.jsonl"):
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def browser_api(page, method, path, body=None):
+    return page.evaluate(
+        """async ({method, path, body}) => {
+            const opts = {method, credentials: "include", headers: {}};
+            if (body !== null && body !== undefined) {
+                opts.headers["Content-Type"] = "application/json";
+                opts.body = typeof body === "string" ? body : JSON.stringify(body);
+            }
+            const r = await fetch(path, opts);
+            const text = await r.text();
+            let json = null;
+            try { json = JSON.parse(text); } catch {}
+            return {status: r.status, ok: r.ok, url: r.url, text, json};
+        }""",
+        {"method": method, "path": path, "body": body},
+    )
+
+
 def main():
+    import re
+    import uuid
+
     cfg = load_config()
     email = resolve_email(cfg)
     proxy = (cfg.get("proxy") or "").strip() or None
@@ -63,6 +84,10 @@ def main():
         "reg_status": None,
         "reg_body": None,
         "confirm_data": {},
+        "post_reg_navs": [],
+        "post_reg_loaded": False,
+        "hatch_logs": [],
+        "trace": [],
     }
 
     with sync_playwright() as p:
@@ -110,14 +135,76 @@ def main():
 
         page.route("**/api/auth/native/register-completion", on_route)
 
+        def _is_traced(url):
+            return (
+                ("muse.ai" in url or "auth.meta.com" in url)
+                and ("/api/" in url or "/hatch/" in url or url.rstrip("/") in ("https://muse.ai", "https://muse.ai/?aymh_complete=1"))
+            )
+
+        def on_request(req):
+            url = req.url
+            if state["reg_status"] == 200 and req.is_navigation_request() and req.frame == page.main_frame:
+                state["post_reg_navs"].append(f"{req.method} {url}")
+            if _is_traced(url):
+                try:
+                    hdrs = dict(req.headers)
+                    cookie_raw = hdrs.pop("cookie", "")
+                    cookie_names = [kv.split("=", 1)[0].strip() for kv in cookie_raw.split(";") if "=" in kv]
+                    if "x-hatch-csrf-token" in hdrs:
+                        hdrs["x-hatch-csrf-token"] = f"<len:{len(hdrs['x-hatch-csrf-token'])}>"
+                    post = req.post_data
+                    if post and "frl_access_token=" in post:
+                        post = "<form frl_access_token masked>"
+                    elif post and '"otp_code"' in post:
+                        try:
+                            pj = json.loads(post)
+                            if "otp_code" in pj:
+                                pj["otp_code"] = f"<len:{len(str(pj['otp_code']))}>"
+                            post = json.dumps(pj, ensure_ascii=False)
+                        except Exception:
+                            pass
+                    state["trace"].append({
+                        "t": round(time.time(), 3),
+                        "method": req.method,
+                        "url": url,
+                        "type": req.resource_type,
+                        "nav": req.is_navigation_request(),
+                        "cookie_names": sorted(set(cookie_names)),
+                        "headers": hdrs,
+                        "post": post,
+                    })
+                except Exception:
+                    pass
+
+        page.on("request", on_request)
+
+        def on_load():
+            if state["reg_status"] == 200 and "muse.ai" in page.url and "/api/" not in page.url:
+                state["post_reg_loaded"] = True
+
+        page.on("load", on_load)
+
         def on_response(resp):
-            if "/api/auth/native/confirm-otp" in resp.url:
+            url = resp.url
+            if _is_traced(url):
+                for item in reversed(state["trace"]):
+                    if item["url"] == url and "status" not in item:
+                        item["status"] = resp.status
+                        try:
+                            ah = resp.all_headers()
+                            sc = ah.get("set-cookie", "")
+                            if sc:
+                                item["set_cookies"] = [ln.split("=", 1)[0].strip() for ln in sc.splitlines() if "=" in ln]
+                        except Exception:
+                            pass
+                        break
+            if "/api/auth/native/confirm-otp" in url:
                 state["confirm_status"] = resp.status
                 try:
                     state["confirm_data"] = resp.json() or {}
                 except Exception:
                     pass
-            elif "/api/auth/native/register-completion" in resp.url:
+            elif "/api/auth/native/register-completion" in url:
                 state["reg_status"] = resp.status
                 try:
                     data = resp.json() or {}
@@ -125,6 +212,8 @@ def main():
                     state["uid"] = (data.get("auth_meta_session") or {}).get("frl_account_id")
                 except Exception:
                     state["reg_body"] = resp.text()
+            elif state["reg_status"] == 200 and "/api/hatch/" in url:
+                state["hatch_logs"].append(f"{resp.request.method} {url.split('muse.ai')[-1]} -> {resp.status}")
 
         page.on("response", on_response)
 
@@ -225,51 +314,137 @@ def main():
             browser.close()
             raise SystemExit(f"注册失败: register-completion {state['reg_status']}: {state['reg_body']}")
 
-        # 等待浏览器完成会话跳转并落盘 hatch_sess cookie
-        for _ in range(20):
-            cookies = context.cookies("https://muse.ai")
-            if any(c["name"] == "hatch_sess" for c in cookies):
+        uid = state["uid"]
+        print(f"    注册成功! account_id = {uid}")
+
+        # 等待 auth.meta.com/hatch/session/bootstrap/ 表单跳转回 muse.ai 完成会话同步
+        print("    正在等待会话同步跳转回 muse.ai...")
+        left_muse = False
+        for step in range(40):
+            cur_url = page.url
+            if "muse.ai" not in cur_url:
+                left_muse = True
+            if state["post_reg_loaded"] and "muse.ai" in cur_url and "/api/" not in cur_url:
+                break
+            if left_muse and "muse.ai" in cur_url and "/api/" not in cur_url:
+                break
+            if step >= 10 and not state["post_reg_navs"] and "muse.ai" in cur_url:
                 break
             page.wait_for_timeout(500)
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=15000)
+        except Exception:
+            pass
+        page.wait_for_timeout(1500)
+        if state["post_reg_navs"]:
+            print(f"    同步跳转链 ({len(state['post_reg_navs'])} 跳) -> {page.url}")
+        else:
+            print(f"    当前页面: {page.url}")
 
-        all_cookies = context.cookies()
+        # 在同一浏览器会话内执行激活、唤醒、兑换
+        print("[6] 激活会话（accept-tos）")
+        inv = browser_api(page, "GET", "/api/hatch/invite")
+        if inv["status"] != 200:
+            for attempt in range(2):
+                tos_res = browser_api(
+                    page,
+                    "POST",
+                    "/api/hatch/accept-tos",
+                    {
+                        "saw_meta_ai_tos": False,
+                        "client_request_timestamp": str(int(time.time())),
+                        "entry_point": "web_onboarding_flow",
+                        "nux_type": "ROW",
+                        "disclosure_version": "HATCH_ROW_v0",
+                        "disclosure_text": DISCLOSURE_TEXT_JA,
+                    },
+                )
+                print(f"    accept-tos[{attempt+1}] = {tos_res['status']} {tos_res['text'][:160]}")
+                inv = browser_api(page, "GET", "/api/hatch/invite")
+                if inv["status"] == 200:
+                    break
+                time.sleep(1.2)
+        live = inv["status"] == 200
+        inv_desc = "200 活号" if live else f"{inv['status']} ({inv['text'][:120]})"
+        print(f"    invite = {inv_desc}")
+        if not live:
+            try:
+                btns = [b.strip() for b in page.locator("button:visible").all_inner_texts() if b.strip()][:8]
+                if btns or state["hatch_logs"]:
+                    print(f"    页面调试: buttons={btns} auto_hatch={state['hatch_logs']}")
+            except Exception:
+                pass
+
+        print("[7] 唤醒 VM")
+        html = page.content()
+        m = re.search(r'(?:vmId|vm_id)[\\"]*:[\\"]*([0-9a-fA-F-]{36})', html)
+        home_status = None
+        if not m:
+            home_res = browser_api(page, "GET", "/?aymh_complete=1")
+            home_status = home_res["status"]
+            m = re.search(r'(?:vmId|vm_id)[\\"]*:[\\"]*([0-9a-fA-F-]{36})', home_res["text"])
+        vm = m.group(1) if m else None
+        if vm:
+            wake_res = browser_api(
+                page,
+                "POST",
+                "/api/hatch/vm/wake",
+                {
+                    "vm_id": vm,
+                    "retry_count": 0,
+                    "connect_attempt_id": str(uuid.uuid4()),
+                    "wake_trigger": "resume",
+                },
+            )
+            print(f"    vm_id = {vm} (wake={wake_res['status']})")
+        else:
+            print(f"    vm_id = None (aymh_home={home_status})")
+
+        browser_api(page, "POST", "/api/hatch/stateful-sharing", "")
+
+        own = None
+        print(f"[8] 兑换邀请码  {invite_code or '(未配置)'}")
+        if invite_code:
+            red = browser_api(
+                page,
+                "POST",
+                "/api/hatch/invite-code/redeem",
+                {"code": invite_code, "supportsRedemptionStatus": True},
+            )
+            data = red["json"] or {}
+            ok = red["status"] == 200 and (data.get("success") is True or data.get("redemptionStatus") == "redeemed")
+            reason = "redeemed" if ok else (data.get("reason") or f"http-{red['status']}: {red['text'][:160]}")
+            print(f"    redeem = {ok} / {reason}")
+            if ok:
+                sc = browser_api(page, "POST", "/api/hatch/invite", "")
+                if sc["status"] == 200 and sc["json"]:
+                    own = sc["json"].get("code")
+                print(f"[9] 自己的邀请码 = {own}")
+            else:
+                print("    失败原因映射: already_redeemed=本账号已用过码  used_up=该码已达使用上限  invalid=码不存在")
+
+        cookies = context.cookies("https://muse.ai")
+        sess = next((ck["value"] for ck in cookies if ck["name"] == "hatch_sess"), None)
+        try:
+            with open(".last_browser_trace.json", "w", encoding="utf-8") as tf:
+                json.dump(
+                    {
+                        "page_url": page.url,
+                        "post_reg_navs": state["post_reg_navs"],
+                        "cookies": [
+                            {"name": ck["name"], "domain": ck.get("domain"), "path": ck.get("path"), "len": len(ck.get("value") or "")}
+                            for ck in context.cookies()
+                        ],
+                        "trace": state["trace"],
+                    },
+                    tf,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+        except Exception:
+            pass
         browser.close()
 
-    uid = state["uid"]
-    print(f"    注册成功! account_id = {uid}")
-
-    # 将浏览器拿到的 Cookie 同步给 MuseClient 执行后续激活与邀请码兑换
-    c = MuseClient(proxy=proxy, impersonate=cfg.get("impersonate", "chrome145"), lang=cfg.get("lang", "ja"))
-    for ck in all_cookies:
-        c.s.cookies.set(ck["name"], ck["value"], domain=ck.get("domain") or "muse.ai", path=ck.get("path") or "/")
-
-    print("[6] 激活会话（accept-tos）")
-    for _ in range(2):
-        c.accept_tos()
-        if c.is_live():
-            break
-        time.sleep(1.2)
-    live = c.is_live()
-    print(f"    invite = {'200 活号' if live else '401/403 无 hatch 权限'}")
-
-    print("[7] 唤醒 VM")
-    vm = c.wake_vm()
-    print(f"    vm_id = {vm}")
-
-    c.stateful_sharing()
-
-    own = None
-    print(f"[8] 兑换邀请码  {invite_code or '(未配置)'}")
-    if invite_code:
-        ok, reason = c.redeem(invite_code)
-        print(f"    redeem = {ok} / {reason}")
-        if ok:
-            own = c.scratch_code()
-            print(f"[9] 自己的邀请码 = {own}")
-        else:
-            print("    失败原因映射: already_redeemed=本账号已用过码  used_up=该码已达使用上限  invalid=码不存在")
-
-    sess = c.session_cookie()
     print(f"\nhatch_sess 长度 = {len(sess or '')}")
 
     save_account({
@@ -283,7 +458,6 @@ def main():
         "created_at": int(time.time()),
     })
     print("已保存到 accounts.jsonl")
-    c.close()
 
 
 if __name__ == "__main__":
