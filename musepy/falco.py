@@ -86,10 +86,12 @@ def send(session, impersonate, lang, session_id, events):
         "content-type": "application/json",
         "origin": BASE,
         "referer": BASE + "/",
-        "accept-language": lang,
+        "accept-language": "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7" if lang == "ja" else lang,
         "sec-fetch-site": "same-origin",
         "sec-fetch-mode": "cors",
         "sec-fetch-dest": "empty",
+        "Upgrade-Insecure-Requests": None,
+        "Sec-Fetch-User": None,
     }
     try:
         return session.post(BASE + "/api/falco", impersonate=impersonate,

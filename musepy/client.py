@@ -25,6 +25,8 @@ HEADERS_JSON = {
     "sec-fetch-site": "same-origin",
     "sec-fetch-mode": "cors",
     "sec-fetch-dest": "empty",
+    "Upgrade-Insecure-Requests": None,
+    "Sec-Fetch-User": None,
 }
 HEADERS_GET = {
     "accept": "*/*",
@@ -32,6 +34,8 @@ HEADERS_GET = {
     "sec-fetch-site": "same-origin",
     "sec-fetch-mode": "cors",
     "sec-fetch-dest": "empty",
+    "Upgrade-Insecure-Requests": None,
+    "Sec-Fetch-User": None,
 }
 HEADERS_HTML = {
     "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
