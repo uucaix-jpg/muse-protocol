@@ -17,15 +17,23 @@ def _ms():
 
 
 def _device_locale(lang):
-    code = (lang or "ja").strip().split(",")[0].split("-")[0].lower()
-    return code or "ja"
+    raw = (lang or "ja").strip().split(",")[0].strip()
+    low = raw.lower()
+    if low in ("ja", "ja-jp"):
+        return "ja-JP"
+    if low in ("zh", "zh-cn"):
+        return "zh-CN"
+    if low in ("en", "en-us"):
+        return "en-US"
+    return raw.replace("_", "-") or "ja-JP"
 
 
 def interaction(uri, action_type, action_target, event_name, meta=None, device_locale="ja"):
-    m = {"surface": "onboarding", "result": "success",
-         "resolution_mode": "blocking", "resolved_destination": "main_app"}
-    if meta:
-        m.update(meta)
+    if meta is not None:
+        m = dict(meta)
+    else:
+        m = {"surface": "onboarding", "result": "success",
+             "resolution_mode": "blocking", "resolved_destination": "main_app"}
     payload = {
         "is_cvm": False,
         "metadata": json.dumps(m, separators=(",", ":")),
@@ -39,17 +47,20 @@ def interaction(uri, action_type, action_target, event_name, meta=None, device_l
             "payload": json.dumps(payload, separators=(",", ":"))}
 
 
-def impression(uri, surface, subsurface, entry_point, extra=None, device_locale="ja"):
-    m = {"surface": surface, "subsurface": subsurface, "entry_point": entry_point}
+def impression(uri, surface, subsurface, entry_point=None, extra=None, device_locale="ja",
+               action_target=None, event_name=None, action_type="one_px_impression"):
+    m = {"surface": surface, "subsurface": subsurface}
+    if entry_point:
+        m["entry_point"] = entry_point
     if extra:
         m.update(extra)
     payload = {
         "is_cvm": False,
         "metadata": json.dumps(m, separators=(",", ":")),
         "uri": uri,
-        "action_type": "one_px_impression",
-        "action_target": subsurface + "_ready",
-        "event_name": subsurface + "_ready_impression",
+        "action_type": action_type,
+        "action_target": action_target or (subsurface + "_ready"),
+        "event_name": event_name or (subsurface + "_ready_impression"),
         "device_locale": device_locale,
     }
     return {"event": "hatch_web_impression", "timeInMs": _ms(), "rate": 1,

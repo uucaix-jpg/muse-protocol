@@ -1,5 +1,6 @@
 """完整注册 + 兑换流程示例。运行前请填写 config.json（见 config.example.json）。"""
 
+import argparse
 import json
 import os
 import sys
@@ -37,7 +38,17 @@ def save_account(record, path="accounts.jsonl"):
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def main():
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description="muse.ai 纯 HTTP 协议注册与兑换示例")
+    p.add_argument("--zh", action="store_true", help="使用 zh-CN 语言/区域进行 A/B 测试")
+    p.add_argument("--ja", action="store_true", help="使用 ja 语言/区域")
+    p.add_argument("--lang", default=None, help="覆盖 config.json 的 lang")
+    p.add_argument("--impersonate", default=None, help="覆盖 config.json 的 curl_cffi impersonate 指纹")
+    return p.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
     cfg = load_config()
 
     email = resolve_email(cfg)
@@ -45,24 +56,34 @@ def main():
     invite_code = cfg.get("invite_code") or ""
     otp_file = cfg.get("otp_file")  # 可选：从文件读取当前验证码
 
+    lang = cfg.get("lang", "ja")
+    if args.zh:
+        lang = "zh-CN"
+    elif args.ja:
+        lang = "ja"
+    if args.lang:
+        lang = args.lang
+    impersonate = args.impersonate or cfg.get("impersonate", "chrome145")
+
     worker_cfg = cfg.get("otp_worker") or {}
     otp_client = None
     if worker_cfg.get("url") and worker_cfg.get("api_key"):
         otp_client = WorkerOtpClient(worker_cfg["url"], worker_cfg["api_key"])
 
-    c = MuseClient(proxy=proxy, impersonate=cfg.get("impersonate", "chrome145"),
-                   lang=cfg.get("lang", "ja"))
+    c = MuseClient(proxy=proxy, impersonate=impersonate, lang=lang)
 
     falco_sid = str(uuid.uuid4())
     send_falco = cfg.get("send_falco", True)
     send_caa = cfg.get("send_caa", True)
+    dev_loc = falco._device_locale(c.lang)
 
     try:
-        print(f"[1] 打开首页  {email}")
+        print(f"[1] 打开首页  {email}  (impersonate={c.fp}, lang={c.lang})")
         c.open_home()
 
         print("[2] 重启注册流程")
         c.restart()
+        c.login_options()
 
         if send_falco:
             falco.send(
@@ -74,9 +95,10 @@ def main():
                     falco.impression(
                         c.landing_url,
                         "login",
-                        "login_home",
-                        "login_home",
-                        device_locale=falco._device_locale(c.lang),
+                        "contact",
+                        device_locale=dev_loc,
+                        action_target="login_page",
+                        event_name="login_page_impression",
                     ),
                 ],
                 referer=c.landing_url,
@@ -92,10 +114,31 @@ def main():
         if otp_client:
             otp_client.clear(email)
 
+        if send_falco:
+            falco.send(
+                c.s,
+                c.fp,
+                c.lang,
+                falco_sid,
+                [
+                    falco.interaction(
+                        c.home_url,
+                        "click",
+                        "login_contact_continue",
+                        "login_contact_continue_click",
+                        meta={"surface": "login", "subsurface": "contact"},
+                        device_locale=dev_loc,
+                    ),
+                ],
+                referer=c.home_url,
+            )
+        if send_caa:
+            funnel.continue_clicked(c.s)
+
         print("[3] 发送验证码")
         c.send_otp(email)
         if send_caa:
-            funnel.continue_and_start(c.s)
+            funnel.registration_start(c.s)
 
         if otp_client:
             print("    正在通过 Cloudflare Email Worker 自动等待验证码...")
@@ -110,6 +153,24 @@ def main():
         else:
             code = input("输入收到的 6 位验证码: ").strip()
 
+        if send_falco:
+            falco.send(
+                c.s,
+                c.fp,
+                c.lang,
+                falco_sid,
+                [
+                    falco.interaction(
+                        c.home_url,
+                        "click",
+                        "login_otp_confirm",
+                        "login_otp_confirm_click",
+                        meta={"surface": "login", "subsurface": "otp"},
+                        device_locale=dev_loc,
+                    ),
+                ],
+                referer=c.home_url,
+            )
         if send_caa:
             funnel.otp_typed(c.s)
 
@@ -123,7 +184,47 @@ def main():
 
         if send_caa:
             funnel.otp_and_birthday_start(c.s)
+        if send_falco:
+            falco.send(
+                c.s,
+                c.fp,
+                c.lang,
+                falco_sid,
+                [
+                    falco.impression(
+                        c.home_url,
+                        "login",
+                        "birthday",
+                        device_locale=dev_loc,
+                        action_target="login_birthday",
+                        event_name="login_birthday_impression",
+                    ),
+                ],
+                referer=c.home_url,
+            )
+        if send_caa or send_falco:
             time.sleep(3)
+
+        if send_falco:
+            falco.send(
+                c.s,
+                c.fp,
+                c.lang,
+                falco_sid,
+                [
+                    falco.interaction(
+                        c.home_url,
+                        "click",
+                        "login_birthday_continue",
+                        "login_birthday_continue_click",
+                        meta={"surface": "login", "subsurface": "birthday"},
+                        device_locale=dev_loc,
+                    ),
+                ],
+                referer=c.home_url,
+            )
+        if send_caa:
+            funnel.birthday_next(c.s)
 
         name_label = f"{first} {last}" if c.requires_name else "(无需姓名)"
         print(f"[5] 完成注册  {name_label}  {dob}")
@@ -134,7 +235,6 @@ def main():
         print(f"    account_id = {uid}")
 
         if send_caa:
-            funnel.birthday_next(c.s)
             funnel.create_success(c.s, uid)
             funnel.login_success(c.s, uid)
 
@@ -158,7 +258,7 @@ def main():
                         "page_load",
                         "main_app",
                         "page_load",
-                        device_locale=falco._device_locale(c.lang),
+                        device_locale=dev_loc,
                     ),
                 ],
                 referer=c.home_url,
@@ -214,11 +314,17 @@ def main():
         })
         print("已保存到 accounts.jsonl")
     except MuseError as e:
+        diag = c.last_diag or {}
+        if send_caa and diag.get("stage") == "register-completion":
+            funnel.create_failure(c.s, diag.get("type") or "registrationBlocked")
         print(f"协议失败: {e}")
-        print(f"诊断信息: impersonate={c.fp} lang={c.lang} cookies={c.cookie_summary()}")
+        print(f"诊断信息: impersonate={c.fp} lang={c.lang} diag={diag} cookies={c.cookie_summary()}")
         if "registrationBlocked" in str(e):
-            print("提示: 纯 HTTP 协议已完成完整 Cookie/埋点链但仍被服务端风控拦截，"
-                  "请改用真实浏览器脚本: .venv/bin/python browser_register.py")
+            print(
+                "提示: register-completion 返回 403 registrationBlocked（auth.meta.com 服务端风控拦截，"
+                "可能与出口 IP 信誉、同邮箱域名/账号高频注册或请求环境特征有关；真实无头浏览器同样可能触发）。"
+                "如需抓包对照，可运行: .venv/bin/python browser_register.py --zh"
+            )
         sys.exit(1)
     finally:
         c.close()

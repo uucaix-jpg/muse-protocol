@@ -70,6 +70,8 @@ def accept_language_header(lang):
     low = (lang or "ja").strip().lower()
     if low in ("ja", "ja-jp"):
         return "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7"
+    if low in ("zh", "zh-cn"):
+        return "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7"
     if low in ("en", "en-us"):
         return "en-US,en;q=0.9"
     return lang
@@ -99,6 +101,7 @@ class MuseClient:
         self.requires_name = None
         self.tos_version = None
         self.account_id = None
+        self.last_diag = {}
 
     # ---------- 基础设施 ----------
 
@@ -106,12 +109,16 @@ class MuseClient:
         return accept_language_header(self.lang)
 
     def _region(self):
-        if "-" in self.lang:
-            part = self.lang.split("-", 1)[1].split(",")[0].split(";")[0].strip()
+        if "-" in self.lang or "_" in self.lang:
+            sep = "-" if "-" in self.lang else "_"
+            part = self.lang.split(sep, 1)[1].split(",")[0].split(";")[0].strip()
             if len(part) == 2 and part.isalpha():
                 return part.upper()
-        if self.lang.lower().startswith("ja"):
+        low = self.lang.strip().lower()
+        if low.startswith("ja"):
             return "JP"
+        if low.startswith("zh"):
+            return "CN"
         return None
 
     def _h(self, base, extra=None):
@@ -128,6 +135,33 @@ class MuseClient:
             return resp.json() or {}
         except Exception:
             return {}
+
+    def _record_diag(self, stage, resp, data=None):
+        hdrs = getattr(resp, "headers", None) or {}
+        get_h = lambda k: hdrs.get(k) or hdrs.get(k.lower())
+        parsed = data if isinstance(data, dict) else self._json(resp)
+        diag = {
+            "stage": stage,
+            "status": getattr(resp, "status_code", None),
+            "url": getattr(resp, "url", None),
+            "auth_check_id": get_h("x-hatch-auth-check-id"),
+            "vercel_id": get_h("x-vercel-id"),
+            "cf_ray": get_h("cf-ray"),
+            "type": parsed.get("type") if isinstance(parsed, dict) else None,
+        }
+        self.last_diag = {k: v for k, v in diag.items() if v is not None}
+        return self.last_diag
+
+    def _raise_error(self, stage, resp):
+        data = self._json(resp)
+        diag = self._record_diag(stage, resp, data)
+        bits = []
+        if diag.get("auth_check_id"):
+            bits.append(f"auth_check_id={diag['auth_check_id']}")
+        if diag.get("vercel_id"):
+            bits.append(f"vercel_id={diag['vercel_id']}")
+        tag = f" [{' '.join(bits)}]" if bits else ""
+        raise MuseError(f"{stage} {resp.status_code}{tag}: {resp.text[:160]}")
 
     def cookie_summary(self):
         return sorted({(c.name, c.domain) for c in self.s.cookies.jar})
@@ -162,20 +196,29 @@ class MuseClient:
             pass
         return r
 
-    def restart(self, resume=False):
-        """开启注册流程，返回 csrf_token"""
-        payload = json.dumps({"resume": False}) if resume else "{}"
+    def restart(self, reset=False, resume=None):
+        """开启或重置注册流程，返回 csrf_token。
+
+        首页首次挂载固定发送 "{}"；显式重置流程时才发送 {"resume": false}。
+        """
+        if resume is not None:
+            payload = json.dumps({"resume": bool(resume)})
+        elif reset:
+            payload = json.dumps({"resume": False})
+        else:
+            payload = "{}"
         r = self.s.post(BASE + "/api/auth/native/restart", impersonate=self.fp,
                         headers=self._h(HEADERS_JSON, {"X-Hatch-Waterfall-Id": self.waterfall_id}),
                         data=payload)
+        self._record_diag("restart", r)
         if r.status_code != 201:
-            raise MuseError(f"restart {r.status_code}: {r.text[:120]}")
+            self._raise_error("restart", r)
         data = self._json(r)
         self.csrf = data.get("csrf_token")
         if not self.csrf:
             raise MuseError("restart 未返回 csrf_token")
         if data.get("flow_state") == "new":
-            self.s.post(
+            sr = self.s.post(
                 BASE + "/api/auth/native/start",
                 impersonate=self.fp,
                 headers=self._h(HEADERS_JSON, {
@@ -184,9 +227,20 @@ class MuseClient:
                 }),
                 data="{}",
             )
+            self._record_diag("start", sr)
         # 真实前端在 restart 后通过 history.replaceState 剥离 ?aymh_complete=1
         self.home_url = BASE + "/"
         return self.csrf
+
+    def login_options(self):
+        """复现前端联系点界面挂载后的 passkey/login-options 探测"""
+        try:
+            r = self.s.post(BASE + "/api/auth/native/login-options", impersonate=self.fp,
+                            headers=self._auth_headers(), data="{}")
+            self._record_diag("login-options", r)
+            return self._json(r)
+        except Exception:
+            return {}
 
     def _auth_headers(self):
         h = self._h(HEADERS_JSON)
@@ -203,8 +257,9 @@ class MuseClient:
             body["region"] = reg
         r = self.s.post(BASE + "/api/auth/native/send-otp", impersonate=self.fp,
                         headers=self._auth_headers(), data=json.dumps(body))
+        self._record_diag("send-otp", r)
         if r.status_code not in (200, 201):
-            raise MuseError(f"send-otp {r.status_code}: {r.text[:120]}")
+            self._raise_error("send-otp", r)
         return self._json(r)
 
     def confirm_otp(self, code):
@@ -214,8 +269,9 @@ class MuseClient:
                         data=json.dumps({"otp_code": code,
                                          "remember_device": True,
                                          "supports_muse_link_transparency": True}))
+        self._record_diag("confirm-otp", r)
         if r.status_code != 200:
-            raise MuseError(f"confirm-otp {r.status_code}: {r.text[:120]}")
+            self._raise_error("confirm-otp", r)
         data = self._json(r)
         self.requires_name = bool(data.get("requires_name"))
         tos_ver = (data.get("tos") or {}).get("content_version")
@@ -242,8 +298,9 @@ class MuseClient:
             body["last_name"] = last_name
         r = self.s.post(BASE + "/api/auth/native/register-completion", impersonate=self.fp,
                         headers=self._auth_headers(), data=json.dumps(body))
+        self._record_diag("register-completion", r)
         if r.status_code != 200:
-            raise MuseError(f"register-completion {r.status_code}: {r.text[:160]}")
+            self._raise_error("register-completion", r)
         data = self._json(r)
         self.account_id = (data.get("auth_meta_session") or {}).get("frl_account_id")
         return data

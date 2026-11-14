@@ -163,6 +163,15 @@ class Caa:
              "waterfall_id": self.wid, "client_time_ms": _ms()},
         ])
 
+    def create_failure(self, s, exception_type="registrationBlocked"):
+        return self._send(s, [{
+            "table": T_ACQ, "event_name": "registration_flow_state", "state": "create_failure",
+            "event_category": "registration_funnel", "event_step": "account_creation", "event_flow": "ntm",
+            "entry_point": "login_home", "exception_type": exception_type or "registrationBlocked",
+            "extra_client_data": {"is_native": "1"},
+            "waterfall_id": self.wid, "client_time_ms": _ms(),
+        }])
+
     def create_success(self, s, user_id):
         return self._send(s, [{
             "table": T_ACQ, "event_name": "registration_flow_state", "state": "create_success",
