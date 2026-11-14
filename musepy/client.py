@@ -116,8 +116,6 @@ class MuseClient:
     def open_home(self):
         r = self.s.get(BASE + "/", impersonate=self.fp,
                        headers=self._h(HEADERS_HTML))
-        if r.url:
-            self.home_url = r.url
         self.s.cookies.set("wd", "1440x900", domain="muse.ai", path="/")
         self.s.cookies.set("dpr", "2", domain="muse.ai", path="/")
         try:
@@ -129,7 +127,7 @@ class MuseClient:
 
     def restart(self, resume=False):
         """开启注册流程，返回 csrf_token"""
-        payload = json.dumps({"resume": True}) if resume else "{}"
+        payload = json.dumps({"resume": False}) if resume else "{}"
         r = self.s.post(BASE + "/api/auth/native/restart", impersonate=self.fp,
                         headers=self._h(HEADERS_JSON, {"X-Hatch-Waterfall-Id": self.waterfall_id}),
                         data=payload)
@@ -138,6 +136,11 @@ class MuseClient:
         self.csrf = self._json(r).get("csrf_token")
         if not self.csrf:
             raise MuseError("restart 未返回 csrf_token")
+        try:
+            self.s.post(BASE + "/api/auth/native/login-options", impersonate=self.fp,
+                        headers=self._auth_headers(), data="{}")
+        except Exception:
+            pass
         return self.csrf
 
     def _auth_headers(self):
